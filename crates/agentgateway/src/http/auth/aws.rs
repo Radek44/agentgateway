@@ -594,6 +594,23 @@ fn signing_service_name<'a>(req: &'a http::Request, aws_auth: &'a AwsAuth) -> &'
 		.unwrap_or("bedrock")
 }
 
+/// SigV4 settings for `service`.
+///
+/// S3 is the exception among AWS services: it signs the URI path exactly as sent, with
+/// single percent-encoding and no path normalization, which is how the AWS S3 SDKs
+/// configure their signer. With the aws-sigv4 defaults (double encoding, normalization)
+/// S3 answers `SignatureDoesNotMatch` for any object key containing a character that
+/// needs escaping, such as a space in `fonts/Noto%20Sans%20Regular/0-255.pbf`.
+fn signing_settings(service: &str) -> aws_sigv4::http_request::SigningSettings {
+	let mut settings = aws_sigv4::http_request::SigningSettings::default();
+	if service == "s3" {
+		settings.percent_encoding_mode = aws_sigv4::http_request::PercentEncodingMode::Single;
+		settings.uri_path_normalization_mode =
+			aws_sigv4::http_request::UriPathNormalizationMode::Disabled;
+	}
+	settings
+}
+
 pub(super) async fn sign_request(
 	client: &client::Client,
 	req: &mut http::Request,
@@ -685,7 +702,7 @@ pub(super) async fn sign_request(
 		.region(region)
 		.name(service)
 		.time(std::time::SystemTime::now())
-		.settings(aws_sigv4::http_request::SigningSettings::default())
+		.settings(signing_settings(service))
 		.build()
 		.map_err(BackendAuthError::local)?
 		.into();
@@ -932,6 +949,84 @@ fn credentials_valid(creds: &Credentials) -> bool {
 			.duration_since(SystemTime::now())
 			.is_ok_and(|ttl| ttl > ASSUMED_CREDENTIAL_REFRESH_BUFFER),
 		None => true,
+	}
+}
+
+#[cfg(test)]
+mod signing_settings_tests {
+	use aws_sigv4::http_request::{PercentEncodingMode, UriPathNormalizationMode};
+
+	use super::*;
+
+	#[test]
+	fn s3_signs_the_path_as_sent() {
+		let settings = signing_settings("s3");
+		assert_eq!(settings.percent_encoding_mode, PercentEncodingMode::Single);
+		assert_eq!(
+			settings.uri_path_normalization_mode,
+			UriPathNormalizationMode::Disabled
+		);
+	}
+
+	#[test]
+	fn other_services_keep_the_sigv4_defaults() {
+		for service in ["bedrock", "lambda", "execute-api"] {
+			let settings = signing_settings(service);
+			assert_eq!(settings.percent_encoding_mode, PercentEncodingMode::Double);
+			assert_eq!(
+				settings.uri_path_normalization_mode,
+				UriPathNormalizationMode::Enabled
+			);
+		}
+	}
+
+	fn sign_s3_get(settings: aws_sigv4::http_request::SigningSettings) -> String {
+		let identity = Credentials::new(
+			"AKIDEXAMPLE",
+			"wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+			None,
+			None,
+			"test",
+		)
+		.into();
+		let params = SigningParams::builder()
+			.identity(&identity)
+			.region("us-west-2")
+			.name("s3")
+			.time(SystemTime::UNIX_EPOCH + Duration::from_secs(1_767_225_600))
+			.settings(settings)
+			.build()
+			.unwrap()
+			.into();
+		let request = aws_sigv4::http_request::SignableRequest::new(
+			"GET",
+			"https://example-bucket.s3.us-west-2.amazonaws.com/fonts/Noto%20Sans%20Regular/0-255.pbf",
+			[
+				("host", "example-bucket.s3.us-west-2.amazonaws.com"),
+				(
+					"x-amz-content-sha256",
+					"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+				),
+			]
+			.into_iter(),
+			SignableBody::Bytes(&[]),
+		)
+		.unwrap();
+		sign(request, &params).unwrap().into_parts().1
+	}
+
+	// The expected signatures are what botocore produces for the same request and time:
+	// `S3SigV4Auth` (the S3 client's signer) and the generic `SigV4Auth`.
+	#[test]
+	fn s3_signature_matches_the_s3_client_for_keys_with_spaces() {
+		assert_eq!(
+			sign_s3_get(signing_settings("s3")),
+			"3a17198b13bef82d3f9223bf831611646a58af633f19c5505653d925919bc9c3"
+		);
+		assert_eq!(
+			sign_s3_get(aws_sigv4::http_request::SigningSettings::default()),
+			"ec74c2c643e31c1666ec2a4ceec5b89527d28c41544bcbd43a09b814d5fff510"
+		);
 	}
 }
 
